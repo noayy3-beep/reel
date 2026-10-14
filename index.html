@@ -188,7 +188,12 @@ svg{width:1em;height:1em;fill:currentColor;display:block}
     <p class="sub">Any format your browser can decode (MP4, WebM, MOV, M4V, OGV…) with audio. Files you add are saved on this device; connect GitHub to publish them for everyone.</p>
     <div class="drop" id="drop"><b>Drop videos here or click to browse</b><span>Multiple files supported</span></div>
     <input type="file" id="file" accept="video/*,.mp4,.m4v,.mov,.webm,.ogv,.ogg,.mkv,.avi,.3gp" multiple hidden>
-    <div class="field">
+    <div class="field" id="pwField" style="display:none">
+      <label>UPLOAD PASSWORD</label>
+      <input type="password" id="pw" placeholder="Ask the site owner" autocomplete="off">
+      <div class="hint">Uploads go to the shared library (up to 10&nbsp;GB total, free).</div>
+    </div>
+    <div class="field" id="tokField">
       <label>GITHUB TOKEN — OPTIONAL, PUBLISHES TO EVERYONE</label>
       <input type="password" id="token" placeholder="github_pat_…  (stays in this browser only)" autocomplete="off">
       <div class="hint">Fine-grained token with <b>Contents: read &amp; write</b> on this repo. Max 100&nbsp;MB per file (GitHub limit). Without a token, <a id="ghUpload" target="_blank" rel="noopener">upload through GitHub's website</a> instead.</div>
@@ -209,7 +214,8 @@ const CONFIG = {
   owner:  "",          // e.g. "noayy"
   repo:   "",          // e.g. "reel"
   branch: "main",
-  folder: "videos"     // folder in the repo that holds the videos
+  folder: "videos",    // folder in the repo that holds the videos
+  api:    ""           // your Cloudflare Worker URL (10 GB free storage) — see worker/README.md
 };
 (function autodetect(){
   const m = location.hostname.match(/^([^.]+)\.github\.io$/i);
@@ -243,6 +249,13 @@ const db = new Promise((res,rej)=>{ const r=indexedDB.open("reel",1);
 const tx = async (mode,fn)=>{ const d=await db; return new Promise((res,rej)=>{ const t=d.transaction("v",mode); const rq=fn(t.objectStore("v")); t.oncomplete=()=>res(rq&&rq.result); t.onerror=()=>rej(t.error); }); };
 
 /* ---------- load library ---------- */
+async function loadCloud(){
+  if(!CONFIG.api) return [];
+  try{
+    const r=await fetch(CONFIG.api.replace(/\/$/,"")+"/list"); if(!r.ok) throw 0;
+    return (await r.json()).map(o=>({key:"r2:"+o.key,name:pretty(o.name),file:o.name,src:CONFIG.api.replace(/\/$/,"")+"/v/"+encodeURIComponent(o.key),size:o.size,origin:"github"}));
+  }catch(_){ toast("Couldn't reach the upload server"); return []; }
+}
 async function loadRemote(){
   if(!CONFIG.owner || !CONFIG.repo) return [];
   const u = `https://api.github.com/repos/${CONFIG.owner}/${CONFIG.repo}/contents/${CONFIG.folder}?ref=${CONFIG.branch}`;
@@ -261,8 +274,8 @@ async function loadLocal(){
 }
 async function refresh(keepKey){
   items.forEach(i=>i.origin==="local"&&URL.revokeObjectURL(i.src));
-  const [r,l] = await Promise.all([loadRemote(),loadLocal()]);
-  items = [...r,...l];
+  const [r,c,l] = await Promise.all([loadRemote(),loadCloud(),loadLocal()]);
+  items = [...c,...r,...l];
   render();
   const idx = keepKey ? items.findIndex(i=>i.key===keepKey) : -1;
   if(idx>=0) markActive(idx); else if(cur<0 && items.length) select(0,false);
@@ -299,7 +312,7 @@ function select(i,autoplay){
   const it=items[i]; if(!it) return; cur=i;
   V.src=it.src; V.load(); markActive(i);
   $("title").textContent=it.name;
-  $("meta").textContent=[it.origin==="github"?"From GitHub":"On this device",size(it.size)].join("  ·  ");
+  $("meta").textContent=[it.origin==="github"?"Shared library":"On this device",size(it.size)].join("  ·  ");
   document.title=it.name+" — Reel";
   if(autoplay) V.play().catch(()=>{});
   const c=document.querySelector(`.card[data-i="${i}"]`); c&&c.scrollIntoView({behavior:"smooth",inline:"center",block:"nearest"});
@@ -356,6 +369,7 @@ modal.addEventListener("click",e=>{ if(e.target===modal) closeModal(); });
 $("drop").onclick=()=>$("file").click();
 $("file").onchange=e=>{ handle([...e.target.files]); e.target.value=""; };
 $("ghUpload").href = CONFIG.owner ? `https://github.com/${CONFIG.owner}/${CONFIG.repo}/upload/${CONFIG.branch}/${CONFIG.folder}` : "https://github.com";
+if(CONFIG.api){ $("pwField").style.display="block"; $("tokField").style.display="none"; try{ $("pw").value=localStorage.getItem("reel_pw")||""; }catch(_){} }
 try{ $("token").value=localStorage.getItem("reel_token")||""; }catch(_){}
 $("token").onchange=e=>{ try{ localStorage.setItem("reel_token",e.target.value.trim()); }catch(_){} };
 
@@ -373,22 +387,41 @@ async function pushToGitHub(file,token){
     body:JSON.stringify({message:"Add video: "+file.name,content:await b64(file),branch:CONFIG.branch})});
   if(!r.ok){ const j=await r.json().catch(()=>({})); throw new Error(j.message||("GitHub "+r.status)); }
 }
+const PART=50*1024*1024;
+async function uploadCloud(file,pw,onProg){
+  const base=CONFIG.api.replace(/\/$/,""), H={"X-Password":pw};
+  const j=async r=>{ if(!r.ok) throw new Error((await r.text().catch(()=>""))||("server "+r.status)); return r.json(); };
+  const {key,uploadId}=await j(await fetch(base+"/upload/start?name="+encodeURIComponent(file.name)+"&size="+file.size+"&type="+encodeURIComponent(file.type||"video/mp4"),{method:"POST",headers:H}));
+  const parts=[], n=Math.max(1,Math.ceil(file.size/PART));
+  for(let i=0;i<n;i++){
+    const blob=file.slice(i*PART,(i+1)*PART); let ok=false,err;
+    for(let t=0;t<4&&!ok;t++){
+      try{ parts.push(await j(await fetch(`${base}/upload/part?key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(uploadId)}&n=${i+1}`,{method:"PUT",headers:H,body:blob}))); ok=true; }
+      catch(e){ err=e; await new Promise(r=>setTimeout(r,1000*(t+1))); }
+    }
+    if(!ok) throw err;
+    onProg(Math.round((i+1)/n*100));
+  }
+  await j(await fetch(base+"/upload/finish",{method:"POST",headers:{...H,"Content-Type":"application/json"},body:JSON.stringify({key,uploadId,parts})}));
+}
 async function handle(files){
   files=files.filter(f=>f.type.startsWith("video/")||EXT.test(f.name));
   if(!files.length) return toast("Those don't look like video files");
-  const token=$("token").value.trim(), canPush=token&&CONFIG.owner&&CONFIG.repo;
+  const token=$("token").value.trim(), canPush=token&&CONFIG.owner&&CONFIG.repo, cloud=!!CONFIG.api;
+  const pw=$("pw").value.trim(); try{ localStorage.setItem("reel_pw",pw); }catch(_){}
   for(const f of files){
     const q=document.createElement("div"); q.className="q"; q.innerHTML=`<span class="n">${esc(f.name)}</span><span class="s">${size(f.size)} · saving…</span>`; $("queue").append(q);
     const s=q.querySelector(".s");
     try{
-      if(canPush){ s.textContent="publishing to GitHub…"; await pushToGitHub(f,token); s.textContent="published ✓ (live in a few seconds)"; }
+      if(cloud){ await uploadCloud(f,pw,p=>s.textContent=`${size(f.size)} · uploading ${p}%`); s.textContent="published ✓ everyone can see it"; }
+      else if(canPush){ s.textContent="publishing to GitHub…"; await pushToGitHub(f,token); s.textContent="published ✓ (live in a few seconds)"; }
       else { await tx("readwrite",st=>st.add({name:f.name,blob:f})); s.textContent="saved on this device ✓"; }
       q.classList.add("ok");
     }catch(err){ q.classList.add("err"); s.textContent="failed: "+(err.message||err);
-      if(canPush){ try{ await tx("readwrite",st=>st.add({name:f.name,blob:f})); s.textContent+=" — kept on this device"; }catch(_){} } }
+      if(!cloud&&canPush){ try{ await tx("readwrite",st=>st.add({name:f.name,blob:f})); s.textContent+=" — kept on this device"; }catch(_){} } }
   }
   await refresh(items[cur]&&items[cur].key);
-  if(canPush) setTimeout(()=>refresh(items[cur]&&items[cur].key),4000);
+  if(canPush&&!cloud) setTimeout(()=>refresh(items[cur]&&items[cur].key),4000);
 }
 
 refresh();
